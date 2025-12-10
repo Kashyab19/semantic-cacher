@@ -16,14 +16,21 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
+    HnswConfig,
+    HnswConfigDiff,
     NamedVector,
     PointStruct,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
     SparseIndexParams,
-    SparseVector,  # <--- ADD THIS
+    SparseVector,
     SparseVectorParams,
     VectorParams,
 )
 from sentence_transformers import SentenceTransformer
+
+from app.database import init_db, log_request  # Import our new tools
 
 ml_models = {}
 
@@ -40,6 +47,10 @@ class ChatResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Initialize SQLite Logger
+    print("0. Initializing Traffic Log...")
+    init_db()
+
     print("1. Loading embedding models (FastEmbed)...")
     ml_models["dense_model"] = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
@@ -53,8 +64,8 @@ async def lifespan(app: FastAPI):
     client = QdrantClient(host="localhost", port=6333)
     ml_models["qdrant"] = client
 
-    # NEW COLLECTION NAME due to schema change
-    collection_name = "chat_cache_v2"
+    # New changes includes newer HNSW config
+    collection_name = "chat_cache_v3"
 
     if not client.collection_exists(collection_name):
         print(
@@ -63,7 +74,17 @@ async def lifespan(app: FastAPI):
         client.create_collection(
             collection_name=collection_name,
             # DENSE vectors use VectorParams
-            vectors_config={"dense": VectorParams(size=384, distance=Distance.COSINE)},
+            vectors_config={
+                "dense": VectorParams(
+                    size=384,
+                    distance=Distance.COSINE,
+                    quantization_config=ScalarQuantization(
+                        scalar=ScalarQuantizationConfig(
+                            type=ScalarType.INT8, quantile=0.99, always_ram=True
+                        )
+                    ),
+                )
+            },
             # SPARSE vectors use SparseVectorParams
             sparse_vectors_config={
                 "sparse": SparseVectorParams(
@@ -72,6 +93,12 @@ async def lifespan(app: FastAPI):
                     )
                 )
             },
+            # hnsw config::
+            hnsw_config=HnswConfigDiff(
+                m=16,  # number of nodes in the vector dimension
+                ef_construct=100,  # search depth during build
+                full_scan_threshold=1000,
+            ),
         )
         print("Collection created!")
 
@@ -95,6 +122,9 @@ async def health():
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    req_id = uuid.uuid4().hex
+    start_time = time.time()
+
     # 1. generate hybrid vectors
     dense_model = ml_models["dense_model"]
     sparse_model = ml_models["sparse_model"]
@@ -117,7 +147,7 @@ async def chat(request: ChatRequest):
     # 2. SEARCH
     # We pass the raw dense_vector list and tell it to look in the "dense" index
     search_results = client.query_points(
-        collection_name="chat_cache_v2",
+        collection_name="chat_cache_v3",
         query=dense_vector,
         using="dense",
         limit=1,
@@ -130,6 +160,10 @@ async def chat(request: ChatRequest):
     if search_results.points and search_results.points[0].score > threshold:
         print(f"CACHE HIT! Score: {search_results.points[0].score}")
         cached_text = search_results.points[0].payload["response"]
+        latency = time.time() - start_time
+
+        # LOG IT!
+        log_request(req_id, request.prompt, "cache", latency, cached_text)
         return StreamingResponse(streamer(cached_text), media_type="text/plain")
 
     # 4. CACHE MISS
@@ -141,6 +175,8 @@ async def chat(request: ChatRequest):
             sparse_vector,
             client,
             ml_models,
+            req_id,
+            start_time,
         ),
         media_type="text/plain",
     )
@@ -157,7 +193,7 @@ async def streamer(text: str):
 
 # Split 'vector' into 'dense_vector' and 'sparse_vector'
 async def stream_and_cache_generator(
-    prompt: str, dense_vector, sparse_vector, client, ml_models
+    prompt: str, dense_vector, sparse_vector, client, ml_models, req_id, start_time
 ):
     """
     1. Stream from Ollama
@@ -170,7 +206,7 @@ async def stream_and_cache_generator(
     payload = {
         "model": "qwen2.5:0.5b",
         "prompt": prompt,
-        "stream": True,  # <--- ENABLE STREAMING
+        "stream": True,
     }
 
     try:
@@ -198,8 +234,14 @@ async def stream_and_cache_generator(
                                     f"Stream finished. Caching {len(full_response)} chars..."
                                 )
 
+                                latency = time.time() - start_time
+
+                                log_request(
+                                    req_id, prompt, "llm", latency, full_response
+                                )
+
                                 client.upsert(
-                                    collection_name="chat_cache_v2",
+                                    collection_name="chat_cache_v3",
                                     points=[
                                         PointStruct(
                                             id=uuid.uuid4().hex,

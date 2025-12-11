@@ -44,3 +44,7 @@ htmlcov/
 Thumbs.db
 
 qdrant_storage
+
+# dovker
+# Docker artifacts (If you accidentally build into local folders)
+.docker/

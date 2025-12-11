@@ -1,8 +1,10 @@
 fastapi
-uvicorn[standard]
-httpx
+uvicorn
 qdrant-client
-sentence-transformers
-openai
-pydantic-settings
-python-dotenv
+fastembed
+httpx
+pydantic
+# New additions for Phase 2 & 5
+streamlit
+plotly
+pandas

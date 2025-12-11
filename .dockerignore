@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+.git/
+traffic_logs.db  # Don't overwrite the live DB with your local testing one
+qdrant_data/
